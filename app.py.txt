@@ -1,0 +1,218 @@
+
+from datetime import datetime
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, ForeignKey, BigInteger
+from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.ext.declarative import declarative_base
+import os
+
+from flask import Flask, request, jsonify
+from werkzeug.utils import secure_filename
+
+
+
+app = Flask(__name__)
+
+
+UPLOAD_FOLDER = 'uploads'
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+
+DATABASE_URL = "sqlite:///pdf_data.db"
+engine = create_engine(DATABASE_URL)
+Base = declarative_base() # This is the foundation for all our diary pages (tables)
+
+
+
+
+class PDFFile(Base):
+    __tablename__ = 'pdf_files'
+    id = Column(Integer, primary_key=True)
+    file_name = Column(String(255), nullable=False)
+    file_path = Column(String(512), nullable=False)
+    upload_date = Column(DateTime, default=datetime.utcnow)
+    file_size = Column(BigInteger)
+
+    
+    texts = relationship("ExtractedText", back_populates="pdf_file", cascade="all, delete-orphan")
+    entities = relationship("ExtractedEntity", back_populates="pdf_file", cascade="all, delete-orphan")
+
+    
+    def to_dict(self):
+        return {
+            "pdf_id": self.id,
+            "file_name": self.file_name,
+            "file_path": self.file_path,
+            "upload_date": self.upload_date.isoformat(),
+            "file_size": self.file_size
+        }
+    
+
+
+class ExtractedText(Base):
+    __tablename__ = 'extracted_text'
+    id = Column(Integer, primary_key=True)
+    pdf_id = Column(Integer, ForeignKey('pdf_files.id'), nullable=False) # Links back to the book's ID
+    page_number = Column(Integer) 
+    raw_text = Column(Text)       
+
+    pdf_file = relationship("PDFFile", back_populates="texts")
+
+
+class ExtractedEntity(Base):
+    __tablename__ = 'extracted_entities'
+    id = Column(Integer, primary_key=True)
+    pdf_id = Column(Integer, ForeignKey('pdf_files.id'), nullable=False) # Links back to the book's ID
+    entity_name = Column(String(100), nullable=False) # The name of the fact (e.g., "Policy_No")
+    entity_value = Column(String(512))               # The value of the fact (e.g., "2311204139555102000")
+    page_number = Column(Integer)
+
+    pdf_file = relationship("PDFFile", back_populates="entities")
+
+
+
+Base.metadata.create_all(engine)
+import pdfplumber
+
+def extract_structured_data(text_content):
+    
+    structured_data = {}
+
+    
+    structured_data['Policy_No'] = next((line.split()[-1] for line in text_content.split('\n') if 'Policy No.' in line), None)
+    
+    
+    structured_data['Customer_Name'] = next((line for line in text_content.split('\n') if 'MR JALVIN UPADHYAY' in line), None)
+    
+    
+    structured_data['Vehicle_Model'] = next((line.split()[0] for line in text_content.split('\n') if 'VERNA-1.6 CRDI SX' in line), None)
+    
+    
+    structured_data['Total_Premium'] = next((line.split()[-1] for line in text_content.split('\n') if 'Total Premium' in line), None)
+
+    
+    return {k: v for k, v in structured_data.items() if v}
+
+Session = sessionmaker(bind=engine)
+
+def process_pdf_extraction_and_storage(file_path, file_name, file_size):
+    
+    session = Session()
+    pdf_id = None
+    extraction_status = "failure"
+    recognized_data = {}
+    pdf_metadata = {}
+
+    try:
+        
+        new_pdf_file = PDFFile(
+            file_name=file_name,
+            file_path=file_path,
+            file_size=file_size
+        )
+        session.add(new_pdf_file)
+        session.commit() 
+        pdf_id = new_pdf_file.id
+        pdf_metadata = new_pdf_file.to_dict() 
+
+        
+        full_raw_text = []
+        with pdfplumber.open(file_path) as pdf:
+            for page_num, page in enumerate(pdf.pages, 1):
+                raw_text = page.extract_text()
+                
+                
+                new_text = ExtractedText(
+                    pdf_id=pdf_id,
+                    page_number=page_num,
+                    raw_text=raw_text if raw_text else ""
+                )
+                session.add(new_text)
+                full_raw_text.append(raw_text if raw_text else "")
+
+
+        
+        full_document_text = "\n".join(full_raw_text) 
+        recognized_data = extract_structured_data(full_document_text)
+
+        
+        for name, value in recognized_data.items():
+            new_entity = ExtractedEntity(
+                pdf_id=pdf_id,
+                entity_name=name,
+                entity_value=value,
+                page_number=0 
+            )
+            session.add(new_entity)
+
+        
+        session.commit()
+        extraction_status = "success"
+
+    except Exception as e:
+        session.rollback() 
+        print(f"Extraction failed: {e}")
+    finally:
+        session.close() # Close the diary
+
+    
+    return {
+        "pdf_id": pdf_id,
+        "metadata": pdf_metadata,
+        "extraction_status": extraction_status,
+        "recognized_structured_data": recognized_data
+    }
+
+
+
+@app.route('/upload-pdf', methods=['POST'])
+def upload_pdf_file():
+    
+    
+    if 'file' not in request.files:
+        return jsonify({"message": "No file part in the request"}), 400
+
+    file = request.files['file']
+
+    
+    if file.filename == '':
+        return jsonify({"message": "No file selected"}), 400
+
+    
+    if not file.filename.lower().endswith('.pdf'):
+        return jsonify({"message": "Invalid file type. Only PDF files are allowed."}), 400
+
+    
+    filename = secure_filename(file.filename)
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(file_path)
+
+    
+    file_size = os.path.getsize(file_path)
+
+    
+    result = process_pdf_extraction_and_storage(file_path, filename, file_size)
+
+    
+    if result['extraction_status'] == 'success':
+        return jsonify({
+            "status": "success",
+            "message": "PDF uploaded, extracted, and data saved to database.",
+            "pdf_id": result['pdf_id'],
+            "metadata": result['metadata'],
+            "recognized_structured_data": result['recognized_structured_data']
+        }), 201
+    else:
+        
+        return jsonify({
+            "status": "failure",
+            "message": "PDF uploaded, but extraction or database saving failed.",
+            "pdf_id": result['pdf_id']
+        }), 500
+
+
+if __name__ == '__main__':
+    print("Starting the PDF Robot...")
+    
+    app.run(debug=True)
